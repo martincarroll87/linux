@@ -1,0 +1,528 @@
+#!/bin/bash
+#cat > /usr/sbin/mytemp <<'EOF'
+cat > mytemp <<'EOF'
+#!/bin/bash
+# --------------------------------------------------------------------------
+# a system monitoring script for debian based systems #
+#
+# origninally from a python pi script; ironically it doesnt work on pi at the moment
+# requires : lspci, sensors, [hddtemp], [dmi-decode], [decode-dimms]
+#
+# --------------------------------------------------------------------------
+unloadModules() {
+  modprobe -r eeprom
+  modprobe -r i2c-i801
+}
+
+dieScriptDie() {
+  [[ "$EUID" == '0' ]] && unloadModules
+  echo ''
+  exit 1
+}
+
+trap dieScriptDie INT
+
+fail() {
+  echo ''
+  echo "!!! ${1} !!!"
+  dieScriptDie
+}
+
+# ------------------------------------
+usage() {
+  echo ''
+  echo "usage: $0 [-i num] [-l log_file] [profile_name] [info]"
+  echo '    info : show raw sensor output'
+  echo '    -i   : set interval to run, in seconds'
+  echo '    -l   : enable logging, specify log file'
+  echo ' - - - To monitor the system you need to make a profile - - -'
+  echo '  current profile options'
+  echo '       kav | n330 | 9100e[HDD] | 965[HDD] | 860 | nas'
+  echo ''
+}
+
+# ------------------------------------
+# interval to print tempHead
+intervalTempHead='5'
+
+# sleep between loops
+# sensor poll takes ~1sec; interval=n+1
+if [ "$1" == '-i' ]; then
+  if ! [[ "$2" =~ ^[0-9]+$ ]]; then
+    echo -e "\n!!! argument for '-i' must be numeric !!!\n"
+    exit 1
+  fi
+  interval="$2"
+  shift 2
+else
+  interval='1'
+fi
+
+# ------------------------------------
+# logging
+if [ "$1" == '-l' ]; then
+  if [[ -z "$3" ]]; then
+    echo -e "\n!!! argument for '-l' must be passed !!!\n"
+    exit 1
+  fi
+  logme='on' # on|off
+  logFileName="${2}"
+  shift 2
+else
+  logFileName='mytemp.log'
+fi
+
+#logme='on' # on|off
+#logFileName='mytemp.log'
+#logFileSizeMax=5000000
+logFileSizeMax=1000000
+
+#[ -f ${logFileName} ] && rm ${logFileName}
+logFileSizeCheck(){
+  if [ -f ${logFileName} ] ; then
+    logFileSize=$(wc -c <"${logFileName}")
+    if [ "$logFileSize" -gt "$logFileSizeMax" ]; then
+
+    # remove log #
+    #echo "size $actualsize is over $maxlogsize bytes"
+    echo "# ------------------------------------------ #"
+    echo "  !! !! !! !! !!   WARNING   !! !! !! !! !!"
+    echo "  Log File Size     : $logFileSize bytes"
+    echo "  Log File Size Max : $logFileSizeMax bytes"
+    echo "  Log File \"logFileName\" has been deleted"
+    echo "# ------------------------------------------ #"
+    rm ${logFileName}
+    sleep 1
+
+    # compress log #
+    #if ls $logFileName.[0-9.*].gz &>/dev/null; then
+    #  logNum=`ls $logFileName.[0-9.*].gz | tail -n1 | awk -F. '{print $2}'`
+    #  ((logNum++))
+    #else
+    #  logNum='1'
+    #fi
+    #echo "size $actualsize is over $maxlogsize bytes"
+    #echo "----------------------------------------------"
+    #echo "log file compressed at : ${date}"
+    #echo "size $actualsize is over $maxlogsize bytes"
+    #echo "----------------------------------------------"
+    #gzip ${logFileName} > ${logFileName}.${logNum}.gz && sleep 1
+
+    #else echo "size $actualsize is under $maxlogsize bytes"
+    fi
+  fi
+}
+
+logStart() {
+  ( echo "# ----------------- Monitoring started: $(date)" >> ${logFileName} ) 2>/dev/null || fail "Can't write to \"${logFileName}\""
+  printf "#      date         $(tempHead)\n" >> ${logFileName}
+  printf "# ================= $(tempHead2)\n" >> ${logFileName}
+}
+logLoop() {
+  (( $count % 100 == 0 )) && ( tempHead >> ${logFileName}; logFileSizeCheck; )
+  printf "`date +%Y-%m-%d" "%H:%M:%S` ${tempNow}\n" >> ${logFileName}
+}
+
+# --------------------------------------------------------------------------
+# system info #
+# --------------------------------------------------------------------------
+echo '... populating system information ...'
+
+# ----------------
+#cpu_ver=`grep -m 1 'model name' /proc/cpuinfo | awk -F": " '{printf $2}'`
+cpu_model=$(awk -F': ' '/^model name/{printf $2; exit}' /proc/cpuinfo | sed 's/  */ /g')
+cpu_phys='1'
+if grep -m1 -q '^physical id' /proc/cpuinfo; then
+  cpu_phys="$(tac /proc/cpuinfo | awk '/physical id/{printf $4; exit}')"
+  #cpu_phys="$(awk '/physical id/{print $4}' /proc/cpuinfo | tail -n1)"
+  ((cpu_phys++))
+  #cpu_phys=$((( $cpu_phys + 1 )))
+fi
+#
+cpu_cores=''
+if grep -m1 -q '^cpu cores' /proc/cpuinfo; then
+  cpu_c0=$(awk '/^cpu cores/{printf $4; exit}' /proc/cpuinfo)
+else
+  #cpu_num=`grep -c ^processor /proc/cpuinfo`
+  cpu_c0=$(awk '/^processor/{print $3}' /proc/cpuinfo | tail -n1)
+  cpu_c0=$((( $cpu_c0 + 1 )))
+fi
+cpu_c1=$((( $cpu_phys * $cpu_c0 )))
+cpu_cores="[$cpu_c1]cores"
+#
+if grep -m1 -q '^siblings' /proc/cpuinfo; then
+  cpu_t0=$(awk '/siblings/{printf $3; exit}' /proc/cpuinfo)
+  cpu_t1=$((( $cpu_phys * $cpu_t0 )))
+  cpu_threads="[$cpu_t1]threads"
+else
+  cpu_threads=''
+fi
+cpu_count="[${cpu_phys}]x[${cpu_model} (${cpu_c0}cores|${cpu_t0}threads)] = [${cpu_phys}]cpus ${cpu_cores} ${cpu_threads}"
+cpu_gov0=$([ -d '/sys/devices/system/cpu/cpu0/cpufreq' ] && cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)
+cpu_gov=$([[ -n $cpu_gov0 ]] && printf ', using %s governor' ${cpu_gov0})
+
+# ----------------
+mem_total=$(awk '/^MemTotal/{printf("%.0f",$2/1024); exit}' /proc/meminfo)
+
+# ----------------
+#apt install pciutils
+#gpu_ver=`lspci | grep VGA | awk -F':' '{printf $NF}' | cut -c 2-`
+gpu_ver=`lspci 2>/dev/null | awk -F': ' '/VGA/{printf $NF; exit}'`
+[[ -z "${gpu_ver}" ]] && gpu_ver='whoopsy'
+#
+#cat /proc/bus/pci/devices
+#/sys/bus/pci
+# ----------------
+cpu_min=$([ -d '/sys/devices/system/cpu/cpu0/cpufreq' ] && awk '{printf("%.0f",$1/1000)}' /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq || echo '-----')
+gpu_min='-------'
+#
+cpu_max=$([ -d '/sys/devices/system/cpu/cpu0/cpufreq' ] && awk '{printf("%.0f",$1/1000)}' /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq || echo '-----')
+gpu_max='-------'
+#
+sys_ver=$(awk -F'"' '/^PRETTY_NAME/{print $2; exit}' /etc/os-release)
+sys_arch=`uname -m`
+booted=`date -d @$(( $(date +%s) - $(cut -f1 -d. /proc/uptime) ))`
+kernel=`uname -a`
+
+# ------------------------------------
+#allInfo='on'
+all_info() {
+
+  if [[ "$EUID" != '0' ]]; then
+    echo "This script must be run as root" 1>&2
+    exit 1
+    [ -x /usr/sbin/dmidecode ] || apt-get install dmidecode -y
+    [ -x /usr/bin/decode-dimms ] || apt-get install i2c-tools -y
+    modprobe eeprom
+    modprobe i2c-i801
+  fi
+
+  [[ "$EUID" == '0' && -x '/usr/sbin/dmidecode' ]] && mem_spd=`dmidecode --type 17 | awk '/Speed/{print $2 $3;exit}'` || mem_spd='-------'
+  [[ "$EUID" == '0' && -x '/usr/bin/decode-dimms' ]] && mem_type=`decode-dimms 2>/dev/null | grep -e 'Fundamental Memory type' -e 'Maximum module speed' | sort -u | awk '{ printf substr($0, index($0,$4)) }'`
+  [[ -n "${mem_type}" || "${mem_type}" == Unknown* ]] && mem_type='whoopsy'
+
+  mb_ver=$(
+    if [[ "$EUID" == '0' && -x '/usr/sbin/dmidecode' ]]; then
+    #if [ `whoami` == 'root' ]; then
+      dmidecode -t baseboard | grep -e 'Manufacturer' -e 'Product Name' | awk -F': ' '{printf "%s ", $2}'
+    else
+      echo "must be root to get mb info"
+    fi
+  )
+  [[ -z "${mb_ver}" ]] && mb_ver='whoopsy'
+
+}
+
+# ------------------------------------
+[[ "$allInfo" == 'on' ]] && all_info
+
+echo '====================--------------- system info ---------------===================='
+echo "     cpu: ${cpu_count}${cpu_gov}"
+echo "     gpu: ${gpu_ver}"
+printf "  memory: ${mem_total} MB"; ([[ "$allInfo" == 'on' ]] && printf " ${mem_type}" ); printf "\n"
+[[ "$allInfo" == 'on' ]] && echo "      mb: ${mb_ver}"
+echo '          |  cpu  |   gpu   |  sdram  |'
+printf "min freq: | %5s | %7s | %7s |\n" $cpu_min $gpu_min $mem_spd
+printf "max freq: | %5s | %7s | %7s |\n" $cpu_max $gpu_max $mem_spd
+
+echo "  system: ${sys_ver} on ${sys_arch} build"
+echo "  booted: ${booted}"
+echo "  kernel: ${kernel}"
+
+# --------------------------------------------------------------------------
+# system monitoring #
+# --------------------------------------------------------------------------
+
+# ----------------
+# system profile
+case "$1" in
+  kav)
+    #logme='on'
+    #sys_chip='it8720-isa-0290'
+    #sys_filter() { grep temp; }
+    gpu_chip='nvidia'
+    gpu_filter() { grep Current; }
+    #gpu_chip='nouveau-pci-0200'  # msi 560
+    #gpu_chip='radeon-pci-0300'   # firemv 2260
+    #gpu_filter() { grep temp; }
+    tempHead()   { printf ' cpu   gpu   sda   freq     cpu usage     mem usage\n'; }
+    tempHead2()  { printf '===== ===== ==== ======= =============== ===========\n'; }
+    tempInfo()   { printf "`cpu_temp``gpu_temp``hdd_temp a``cpu_speed``cpu_usage``mem_usage`\n"; }
+    ;;
+  965)
+    sys_chip='it8720-isa-0290'
+    sys_filter() { grep temp; }
+    tempHead()   { printf ' cpu   sys0  sys1  sys2  freq      cpu usage     mem usage\n'; }
+    tempHead2()  { printf '===== ===== ===== ===== ======= =============== ===========\n'; }
+    tempInfo()   { printf "`cpu_temp``sys_temp``cpu_speed``cpu_usage``mem_usage`\n"; }
+    ;;
+  9100e)
+    sys_chip='it8718-isa-0e80'
+    sys_filter() { grep temp[1,2]; }
+    tempHead()   { printf ' cpu   sys0  sys1  freq      cpu usage     mem usage\n'; }
+    tempHead2()  { printf '===== ===== ===== ======= =============== ===========\n'; }
+    tempInfo()   { printf "`cpu_temp``sys_temp``cpu_speed``cpu_usage``mem_usage`\n"; }
+    ;;
+  9100eHDD)
+    sys_chip='it8718-isa-0e80'
+    sys_filter() { grep temp[1,2]; }
+    tempHead()   { printf ' cpu   sys0  sys1  sda  sdb  sdc  sdd  sde  sdf  freq      cpu usage     mem usage\n'; }
+    tempHead2()  { printf '===== ===== ===== ==== ==== ==== ==== ==== ==== ======= =============== ===========\n'; }
+    tempInfo()   { printf "`cpu_temp``sys_temp``hdd_temp a b c d e f``cpu_speed``cpu_usage``mem_usage`\n"; }
+    ;;
+  860)
+    #gpu_chip='nvidia'
+    #gpu_filter() { grep Current; }
+    #gpu_chip='nouveau-pci-0200'  # msi 560
+    gpu_chip='radeon-pci-0300'    # firemv 2260
+    gpu_filter() { grep temp; }
+    tempHead()   { printf ' cpu0  cpu1  cpu2  cpu3  gpu   freq           cpu usage              mem usage\n'; }
+    tempHead2()  { printf '===== ===== ===== ===== ===== ===== =============================== ===========\n'; }
+    tempInfo()   { printf "`cpu_temp``sys_temp``gpu_temp``cpu_speed``cpu_usage``mem_usage`\n"; }
+    ;;
+  860HDD)
+    gpu_chip='nouveau-pci-0200'
+    gpu_filter() { grep temp; }
+    tempHead()   { printf ' cpu0  cpu1  cpu2  cpu3  sys0  sys1  sys2  sda  sdb  sdc  sdd  sde  sdg  freq    cpu usage    mem usage\n'; }
+    tempHead2()  { printf '===== ===== ===== ===== ===== ===== ===== ==== ==== ==== ==== ==== ==== ===== =============== =========\n'; }
+    tempInfo()   { printf "`cpu_temp``sys_temp``hdd_temp a b c d e g``cpu_speed``cpu_usage``mem_usage`\n"; }
+    ;;
+  n330)
+    sys_chip='w83l771-i2c-0-4c'
+    sys_filter() { grep temp; }
+    #sys_filter='temp'
+    gpu_chip='nouveau-pci-0300'
+    gpu_filter() { grep temp; }
+    tempHead()   { printf ' cpu0  cpu1  gpu   sys0  sys1  sda  sdb    cpu usage     mem usage \n'; }
+    tempHead2()  { printf '===== ===== ===== ===== ===== ==== ==== =============== ===========\n'; }
+    tempInfo()   { printf "`cpu_temp``gpu_temp``sys_temp``hdd_temp a b``cpu_usage``mem_usage`"; }
+    ;;
+  nas)
+    tempHead()   { printf ' sda  sdb  sdc  sdd  sde  sdf cpu usage  mem usage\n'; }
+    tempHead2()  { printf '==== ==== ==== ==== ==== ==== ========= ===========\n'; }
+    tempInfo()   { printf "`hdd_temp b c d e f g`  `cpu_usage``mem_usage`\n"; }
+    ;;
+  nasWORKING)
+    tempHead()   { printf '  sda  sdb  sdc  sdd  sde  sdf  freq    mem usage\n'; }
+    tempHead2()  { printf ' ==== ==== ==== ==== ==== ==== ======= ===========\n'; }
+    tempInfo()   { printf "`hdd_temp b c d e f g``cpu_speed``mem_usage`\n"; }
+    ;;
+  info)
+    echo '# # # # # # # # # # # # # # system info # # # # # # # # # # # # # #'
+    echo ' - - - - - - - - - - - - - sensors start - - - - - - - - - - - - -'
+    sensors -v
+    sensors -f
+    echo ' - - - - - - - - - - - - - sensors end - - - - - - - - - - - - - -'
+    if [ -x /usr/sbin/hddtemp ]; then
+      echo ' - - - - - - - - - - - - hard drives start - - - - - - - - - - - -'
+      hddtemp -v
+      hddtemp -u F /dev/sd?
+      echo ' - - - - - - - - - - - - hard drives end - - - - - - - - - - - - -'
+    else
+      echo ' - - - - - - - - - - - hddtemp not installed - - - - - - - - - - -'
+    fi
+    echo '# # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # # '
+    exit 1
+    ;;
+  help|*)
+    usage
+    exit 1
+esac
+
+# ----------------
+lsmod | grep -q k10temp  && cpu_mod() { sensors -f k10temp-pci-00c3 | awk '/temp/{printf $2}'; }
+lsmod | grep -q coretemp && cpu_mod() { sensors -f coretemp-isa-0000 | awk '/Core/{printf $3}'; }
+#lsmod | grep -q coretemp && cpu_mod() { sensors -f coretemp-isa-0000 | awk '$3 - /Core +(.*)/'; }
+
+cpu_temp() {
+  ct=0
+  for i in `cpu_mod | sed -e 's/+//g' -e 's/°F/ /g'`
+  do
+    ((ct++))
+    [[ $ct == 1 ]] && printf "%5s" "$i" || printf "%6s" "$i"
+  done
+}
+
+# ----------------
+gpu_temp () {
+  #cat /proc/bus/pci/devices
+  if [ $gpu_chip == 'nvidia' ]; then
+    if [[ -x /usr/bin/nvidia-smi ]]; then
+      #gC=$(nvidia-smi -q -d temperature | gpu_filter | awk -F: {'printf $2'} | sed -e 's/^ //' -e 's/ C//')
+      #gF=$(($gC * 9/5 + 32))
+      g=$((`nvidia-smi -q -d temperature | gpu_filter | awk -F: {'printf $2'} | sed -e 's/^ //' -e 's/ C//'` * 9/5 + 32))
+      #g=$((`nvidia-smi -q -d temperature | gpu_filter | awk -F': ' {'printf $2'} | sed 's/ C//'` * 9/5 + 32))
+    else
+      g='ERR'
+    fi
+  else
+    g=$(sensors -f $gpu_chip | gpu_filter | awk {'print $2'} | sed -e 's/+//g' -e 's/°F//g')
+    #g=$(sensors -f $gpu_chip | gpu_filter | awk -F'[^0-9]*' '$0=$3')
+  fi
+  printf "%6s" "$g"
+}
+
+# ----------------
+sys_temp () {
+  if [ -n "$sys_chip" ]; then
+    #for i in $(sensors -f "$sys_chip" | awk -v sysf="$sysfilter" '$0 ~ sysf {print $2}' | sed -e 's/+//g' -e 's/°F//g')
+    for i in $(sensors -f "$sys_chip" | sys_filter | awk {'print $2'} | sed -e 's/+//g' -e 's/°F//g')
+    do
+      printf "%6s" "$i"
+    done
+  fi
+}
+
+# ----------------
+cpu_speed() {
+  if [ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq ]; then
+    spd=`awk '{printf("%.0f",$1/1000)}' /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq`
+    printf "%6s" "$spd"
+  else
+    #spd=`lscpu | sed -n '/CPU MHz:/s/CPU MHz: \+//gp'`
+    #spd=`grep -i -m1 'cpu mhz' /proc/cpuinfo | awk -F': ' '{printf $2}'`
+    spd=`awk -F': ' '/^cpu MHz/{printf $2; exit}' /proc/cpuinfo`
+    printf "%5.0fMHz" "$spd"
+  fi
+}
+
+
+# ----------------
+cpu_usage4CoreOnly() {
+  #https://unix.stackexchange.com/questions/152988/how-to-get-cpu-usage-for-every-core-with-a-bash-script-using-standard-nix-tools
+  A=($(sed -n '2,5p' /proc/stat))
+  #     user     + nice     + system   + idle
+  B0=$((${A[1]}  + ${A[2]}  + ${A[3]}  + ${A[4]}))
+  B1=$((${A[12]} + ${A[13]} + ${A[14]} + ${A[15]}))
+  B2=$((${A[23]} + ${A[24]} + ${A[25]} + ${A[26]}))
+  B3=$((${A[34]} + ${A[35]} + ${A[36]} + ${A[37]}))
+  sleep 1
+  C=($(sed -n '2,5p' /proc/stat))
+  #     user     + nice     + system   + idle
+  D0=$((${C[1]}  + ${C[2]}  + ${C[3]}  + ${C[4]}))
+  D1=$((${C[12]} + ${C[13]} + ${C[14]} + ${C[15]}))
+  D2=$((${C[23]} + ${C[24]} + ${C[25]} + ${C[26]}))
+  D3=$((${C[34]} + ${C[35]} + ${C[36]} + ${C[37]}))
+  # cpu usage per core
+  E0=$((100 * (B0 - D0 - ${A[4]}  + ${C[4]})  / (B0 - D0)))
+  E1=$((100 * (B1 - D1 - ${A[15]} + ${C[15]}) / (B1 - D1)))
+  E2=$((100 * (B2 - D2 - ${A[26]} + ${C[26]}) / (B2 - D2)))
+  E3=$((100 * (B3 - D3 - ${A[37]} + ${C[37]}) / (B3 - D3)))
+
+  printf " %3s %3s %3s %3s" $E0 $E1 $E2 $E3
+}
+
+cpu_usage() {
+  #uses an associative array to dynamically generate per thread stats
+  unset cu
+  declare -A cu
+  # ----------------
+  while read t0 u n s i; do
+    t=${t0:3:${#t0}}     # thread number
+    cu[r0.t${t}.u]=${u}  # user
+    cu[r0.t${t}.n]=${n}  # nice
+    cu[r0.t${t}.s]=${s}  # system
+    cu[r0.t${t}.i]=${i}  # idle
+    cu[r0.t${t}.total]=$((${cu[r0.t${t}.u]} + ${cu[r0.t${t}.n]} + ${cu[r0.t${t}.s]} + ${cu[r0.t${t}.i]}))
+  done < <(awk '/^cpu[0-9.*]/{printf "%s %s %s %s %s\n", $1, $2, $3, $4, $5}' /proc/stat)
+  numberOfThreads=$t
+  #for i in "${!run0[@]}"; do; echo "$i = ${run0[$i]}"; done
+  # ----------------
+  sleep 1
+  # ----------------
+  while read t0 u n s i; do
+    t=${t0:3:${#t0}}     # thread number
+    cu[r1.t${t}.u]=${u}  # user
+    cu[r1.t${t}.n]=${n}  # nice
+    cu[r1.t${t}.s]=${s}  # system
+    cu[r1.t${t}.i]=${i}  # idle
+    cu[r1.t${t}.total]=$((${cu[r1.t${t}.u]} + ${cu[r1.t${t}.n]} + ${cu[r1.t${t}.s]} + ${cu[r1.t${t}.i]}))
+  done < <(awk '/^cpu[0-9.*]/{printf "%s %s %s %s %s\n", $1, $2, $3, $4, $5}' /proc/stat)
+  # ----------------
+  unset cpuUse
+  for (( c=0; c<=${numberOfThreads}; c++ )); do
+    cu[t${c}.percent]="$((100 * (${cu[r0.t${c}.total]} - ${cu[r1.t${c}.total]} - ${cu[r0.t${c}.i]}  + ${cu[r1.t${c}.i]})  / (${cu[r0.t${c}.total]} - ${cu[r1.t${c}.total]})))"
+    cpuUse+="$(printf '%4s' ${cu[t${c}.percent]})"
+  done
+  echo "$cpuUse"
+}
+
+# ----------------
+#hdd_temp() { for i in $@; do printf '%5s' `hddtemp -u F /dev/sd${i} 2&>/dev/null | awk '{print $(NF)}' | sed 's/°F//g'`; done; }
+#hdd_temp() { for i in $@; do printf '%5s' $($(hddtemp -u F /dev/sd${i} 2>/dev/null | awk '{print $(NF)}' | sed 's/°F//g') || printf 'sleep'); done; }
+hdd_temp() {
+  ct='0'
+  for i in $@; do
+    temp=$(hddtemp -n -u F /dev/sd${i} 2>/dev/null)
+    [[ $temp =~ ^[0-9]+$ ]] || temp='---';
+    [[ $ct == '0' ]] && printf '%4s' "$temp" || printf '%5s' "$temp"
+    ((ct++))
+  done
+}
+
+# ----------------
+mem_usage() {
+  #grep -e 'MemTotal' -e 'Available:' /proc/meminfo | awk '{printf "%s ", $2}' | awk '{printf("%.0f/%.0f", (($1 - $2)/1024), ($1/1024))}'
+  if free | grep -m1 -q 'e:'; then
+    m=`free | awk '/cache:/{printf("%.0f/%.0fMB", ($3/1024), (($3+$4)/1024))}'`
+  else
+    m=`free | awk '/Mem:/{printf("%.0f/%.0fMB", (($3+$5)/1024), ($2/1024))}'`
+  fi
+  printf "%12s" $m
+}
+
+# --------------------------------------------------------------------------
+[[ $logme == 'on' ]] && logStart
+echo ''
+echo '===============---------------------- monitor ----------------------==============='
+tempHead
+tempHead2
+while :; do
+  ((count++)); #count=$(($count + 1));
+  (( $count % $intervalTempHead == 0 )) && tempHead
+  tempNow=$(tempInfo)
+  printf "$tempNow   `date`\n"
+  [[ $logme == 'on' ]] && logLoop
+  sleep $interval
+done
+
+# --------------------------------------------------------------------------
+# code snippets
+mb_ver0=$(
+  if [[ $EUID -eq 0 ]]; then
+  #if [ `whoami` == 'root' ]; then
+    #i=0
+    while IFS='' read line || [[ -n "$line" ]]
+    do
+      #[ "$i" = "6" ] && (printf "$line" | grep -q 'To be' || printf "$line" | awk -F': ' '{printf $2}' | sed 's/^[[:space:]]*//')
+      [[ $line == *'Manufacturer'* ]] && ([[ $line == *'To be'* ]] || printf "$line" | awk -F': ' '{printf $2}')
+      [[ $line == *'Product Name'* ]] && ([[ $line == *'To be'* ]] && printf 'No info from vendor' || printf "$line" | awk -F':' '{printf $2}' )
+      #[[ $line == *'Manufacturer'* && $line != *'To be'* ]] && printf "$line" | awk -F': ' '{printf $2}'
+      #[[ $line == *'Product Name'* && $line != *'To be'* ]] && printf "$line" | awk -F':' '{printf $2}' || printf 'No info from vendor'
+      #i=$(($i+1))
+    done < <(dmidecode -t baseboard)
+  else
+    echo "must be root to get mb info"
+  fi
+)
+
+timeit() {
+time (
+for i in {1..100}; do
+  #cpu_phys="$(tac /proc/cpuinfo | awk '/physical id/{printf $4; exit}')"
+  cpu_phys="$(awk '/physical id/{print $4}' /proc/cpuinfo | tail -n1)"
+done
+)
+}
+
+# --------------------------------------------------------------------------
+
+EOF
+
+#chmod +x /usr/sbin/mytemp
+chmod +x mytemp
+#/usr/sbin/mytemp nas
+#/usr/sbin/mytemp 965
+./mytemp n330
+
+# --------------------------------------------------------------------------
