@@ -424,7 +424,7 @@ cpu_usage() {
     cu[r0.t${t}.s]=${s}  # system
     cu[r0.t${t}.i]=${i}  # idle
     cu[r0.t${t}.total]=$((${cu[r0.t${t}.u]} + ${cu[r0.t${t}.n]} + ${cu[r0.t${t}.s]} + ${cu[r0.t${t}.i]}))
-  done < <(awk '/^cpu[0-9.*]/{printf "%s %s %s %s %s\n", $1, $2, $3, $4, $5}' /proc/stat)
+  done < <(awk '/^cpu[0-9]+/{printf "%s %s %s %s %s\n", $1, $2, $3, $4, $5}' /proc/stat)
   numberOfThreads=$t
   #for i in "${!run0[@]}"; do; echo "$i = ${run0[$i]}"; done
   # ----------------
@@ -437,7 +437,7 @@ cpu_usage() {
     cu[r1.t${t}.s]=${s}  # system
     cu[r1.t${t}.i]=${i}  # idle
     cu[r1.t${t}.total]=$((${cu[r1.t${t}.u]} + ${cu[r1.t${t}.n]} + ${cu[r1.t${t}.s]} + ${cu[r1.t${t}.i]}))
-  done < <(awk '/^cpu[0-9.*]/{printf "%s %s %s %s %s\n", $1, $2, $3, $4, $5}' /proc/stat)
+  done < <(awk '/^cpu[0-9]+/{printf "%s %s %s %s %s\n", $1, $2, $3, $4, $5}' /proc/stat)
   # ----------------
   unset cpuUse
   for (( c=0; c<=${numberOfThreads}; c++ )); do
@@ -509,8 +509,8 @@ mb_ver0=$(
 timeit() {
 time (
 for i in {1..100}; do
-  #cpu_phys="$(tac /proc/cpuinfo | awk '/physical id/{printf $4; exit}')"
-  cpu_phys="$(awk '/physical id/{print $4}' /proc/cpuinfo | tail -n1)"
+  echo 'CPU 3.4%' | awk '/CPU/{printf("%11s", $2);exit}' | cut -f1 -d%  >/dev/null
+  #echo 'CPU 3.4%' | awk '/CPU/{printf("%11s", $2);exit}' | sed 's/%//' >/dev/null
 done
 )
 }
